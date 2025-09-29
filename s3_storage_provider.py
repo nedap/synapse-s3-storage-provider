@@ -21,9 +21,7 @@ import threading
 
 from six import string_types
 
-import aws_encryption_sdk
-import boto3
-import botocore
+from aws_encryption_sdk.internal.structures import MessageFooter
 from aws_encryption_sdk.identifiers import (
     CommitmentPolicy,
     EncryptionKeyType,
@@ -31,6 +29,10 @@ from aws_encryption_sdk.identifiers import (
 )
 from aws_encryption_sdk.internal.crypto.wrapping_keys import WrappingKey
 from aws_encryption_sdk.key_providers.raw import RawMasterKeyProvider
+from aws_encryption_sdk import EncryptionSDKClient
+import boto3
+import botocore
+from botocore.config import Config
 
 from twisted.internet import defer, reactor, threads
 from twisted.python.failure import Failure
@@ -39,6 +41,7 @@ from twisted.python.threadpool import ThreadPool
 from synapse.logging.context import LoggingContext, make_deferred_yieldable
 from synapse.rest.media.v1._base import Responder
 from synapse.rest.media.v1.storage_provider import StorageProvider
+
 
 # Synapse 1.13.0 moved current_context to a module-level function.
 try:
@@ -93,8 +96,14 @@ class S3StorageProviderBackend(StorageProvider):
         self._s3_client_lock = threading.Lock()
 
         threadpool_size = config.get("threadpool_size", 40)
+        self.api_kwargs["config"] = Config(
+            max_pool_connections=threadpool_size,
+        )
+
         self._s3_pool = ThreadPool(name="s3-pool", maxthreads=threadpool_size)
         self._s3_pool.start()
+
+        self._s3_pool.threads
 
         self._cse_client = None
         if "cse_master_key" in config:
@@ -103,9 +112,7 @@ class S3StorageProviderBackend(StorageProvider):
         # Manually stop the thread pool on shutdown. If we don't do this then
         # stopping Synapse takes an extra ~30s as Python waits for the threads
         # to exit.
-        reactor.addSystemEventTrigger(
-            "during", "shutdown", self._s3_pool.stop,
-        )
+        reactor.addSystemEventTrigger("during", "shutdown", self._s3_pool.stop)
 
     def _get_s3_client(self):
         # this method is designed to be thread-safe, so that we can share a
@@ -147,18 +154,18 @@ class S3StorageProviderBackend(StorageProvider):
         return make_deferred_yieldable(
             threads.deferToThreadPool(reactor, self._s3_pool, _store_file)
         )
-    
+
     def store_with_client_side_encryption(self, path):
         s3_client = self._get_s3_client()
         file_name = os.path.join(self.cache_directory, path)
-        with open(file_name, 'rb') as file:
+        with open(file_name, "rb") as file:
             with self._cse_client.encrypt(file) as encryptor:
                 s3_client.upload_fileobj(
-                    Fileobj=encryptor, 
-                    Bucket=self.bucket, 
+                    Fileobj=encryptor,
+                    Bucket=self.bucket,
                     Key=path,
-                    ExtraArgs=self.extra_args)
-
+                    ExtraArgs=self.extra_args,
+                )
 
     def fetch(self, path, file_info):
         """See StorageProvider.fetch"""
@@ -167,9 +174,7 @@ class S3StorageProviderBackend(StorageProvider):
         d = defer.Deferred()
 
         def _get_file():
-            s3_download_task(
-                self, self.bucket, path, self.extra_args, d, logcontext
-            )
+            s3_download_task(self, self.bucket, path, self.extra_args, d, logcontext)
 
         self._s3_pool.callInThread(_get_file)
         return make_deferred_yieldable(d)
@@ -211,7 +216,7 @@ class S3StorageProviderBackend(StorageProvider):
             result["extra_args"]["SSECustomerAlgorithm"] = config.get(
                 "sse_customer_algo", "AES256"
             )
-    
+
         if "cse_master_key" in config:
             result["cse_master_key"] = config["cse_master_key"]
 
@@ -247,7 +252,7 @@ def s3_download_task(s3, bucket, key, extra_args, deferred, parent_logcontext):
                 resp = s3_client.get_object(Bucket=bucket, Key=key)
 
         except botocore.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] in ("404", "NoSuchKey",):
+            if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
                 logger.info("Media %s not found in S3", key)
                 reactor.callFromThread(deferred.callback, None)
                 return
@@ -269,7 +274,7 @@ def _stream_to_producer(reactor, producer, body, s3, status=None, timeout=None):
         reactor
         producer (_S3Responder): Producer object to stream results to
         body (file like): The object to read from
-        s3 (S3StorageProviderBackend): The object to use for client-side encryption 
+        s3 (S3StorageProviderBackend): The object to use for client-side encryption
         status (_ProducerStatus|None): Used to track whether we're currently
             paused or not. Used for testing
         timeout (float|None): Timeout in seconds to wait for consume to resume
@@ -291,9 +296,10 @@ def _stream_to_producer(reactor, producer, body, s3, status=None, timeout=None):
         if body:
             body.close()
 
+
 def stream_body(body, producer, reactor, status, timeout):
     """Stream body to client
-    
+
     Args:
         body (file like): The object to read from
         producer (_S3Responder): Producer object to stream results to
@@ -328,6 +334,7 @@ def stream_body(body, producer, reactor, status, timeout):
 
         reactor.callFromThread(producer._write, chunk)
 
+
 def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
     """Stream body with client-side encryption logic
 
@@ -335,7 +342,7 @@ def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
         body (file like): The object to read from
         producer (_S3Responder): Producer object to stream results to
         reactor
-        s3 (S3StorageProviderBackend): The object to use for client-side encryption 
+        s3 (S3StorageProviderBackend): The object to use for client-side encryption
         status (_ProducerStatus|None): Used to track whether we're currently
             paused or not. Used for testing
         timeout (float|None): Timeout in seconds to wait for consume to resume
@@ -359,14 +366,15 @@ def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
 
             # Check if we were woken up so that we abort the download
             if stop_event.is_set():
+                # Set the footer to avoid exceptions when exited.
+                decryptor.footer = MessageFooter(b"")
                 return
 
             reactor.callFromThread(producer._write, chunk)
 
 
 class _S3Responder(Responder):
-    """A Responder for S3. Created by _S3DownloadThread
-    """
+    """A Responder for S3. Created by _S3DownloadThread"""
 
     def __init__(self):
         # Triggered by responder when more data has been requested (or
@@ -383,8 +391,7 @@ class _S3Responder(Responder):
         self.deferred = defer.Deferred()
 
     def write_to_consumer(self, consumer):
-        """See Responder.write_to_consumer
-        """
+        """See Responder.write_to_consumer"""
         self.consumer = consumer
         # We are a IPushProducer, so we start producing immediately until we
         # get a pauseProducing or stopProducing
@@ -397,19 +404,16 @@ class _S3Responder(Responder):
         self.wakeup_event.set()
 
     def resumeProducing(self):
-        """See IPushProducer.resumeProducing
-        """
+        """See IPushProducer.resumeProducing"""
         # The consumer is asking for more data, signal _S3DownloadThread
         self.wakeup_event.set()
 
     def pauseProducing(self):
-        """See IPushProducer.stopProducing
-        """
+        """See IPushProducer.stopProducing"""
         self.wakeup_event.clear()
 
     def stopProducing(self):
-        """See IPushProducer.stopProducing
-        """
+        """See IPushProducer.stopProducing"""
         # The consumer wants no more data ever, signal _S3DownloadThread
         self.stop_event.set()
         self.wakeup_event.set()
@@ -418,8 +422,7 @@ class _S3Responder(Responder):
                 self.deferred.errback(Exception("Consumer ask to stop producing"))
 
     def _write(self, chunk):
-        """Writes the chunk of data to consumer. Called by _S3DownloadThread.
-        """
+        """Writes the chunk of data to consumer. Called by _S3DownloadThread."""
         if self.consumer and not self.stop_event.is_set():
             self.consumer.write(chunk)
 
@@ -435,8 +438,7 @@ class _S3Responder(Responder):
             self.deferred.errback(failure)
 
     def _finish(self):
-        """Called when there is no more data to write. Called by _S3DownloadThread.
-        """
+        """Called when there is no more data to write. Called by _S3DownloadThread."""
         if self.consumer:
             self.consumer.unregisterProducer()
             self.consumer = None
@@ -465,32 +467,32 @@ class _ProducerStatus(object):
         else:
             self.is_paused.clear()
 
-class ClientSideEncryption():
+
+class ClientSideEncryption:
     def __init__(self, master_key):
         self._key_provider = FixedKeyProvider()
         self._key_provider.set_master_key(master_key)
-        self._encryption_client = aws_encryption_sdk.EncryptionSDKClient(commitment_policy=CommitmentPolicy.FORBID_ENCRYPT_ALLOW_DECRYPT)
+        self._encryption_client = EncryptionSDKClient(
+            commitment_policy=CommitmentPolicy.FORBID_ENCRYPT_ALLOW_DECRYPT,
+        )
 
     def decrypt(self, source):
         return self._encryption_client.stream(
-            mode='d',
-            source=source,
-            key_provider=self._key_provider
+            mode="d", source=source, key_provider=self._key_provider
         )
 
     def encrypt(self, source):
         return self._encryption_client.stream(
-              mode='e',
-              source=source,
-              key_provider=self._key_provider
+            mode="e", source=source, key_provider=self._key_provider
         )
+
 
 class FixedKeyProvider(RawMasterKeyProvider):
     provider_id = "fixed"
 
     def set_master_key(self, master_key):
         self.master_key = hashlib.sha256(master_key.encode("utf-8")).digest()
-        self.add_master_key('')
+        self.add_master_key("")
 
     def _get_raw_key(self, key_id):
         return WrappingKey(
