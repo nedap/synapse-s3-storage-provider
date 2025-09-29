@@ -103,8 +103,6 @@ class S3StorageProviderBackend(StorageProvider):
         self._s3_pool = ThreadPool(name="s3-pool", maxthreads=threadpool_size)
         self._s3_pool.start()
 
-        self._s3_pool.threads
-
         self._cse_client = None
         if "cse_master_key" in config:
             self._cse_client = ClientSideEncryption(config["cse_master_key"])
@@ -370,7 +368,7 @@ def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
             # Check if we were woken up so that we abort the download
             if stop_event.is_set():
                 # Set the footer to avoid exceptions when exited.
-                # decryptor.footer = MessageFooter(b"")
+                decryptor.footer = MessageFooter(b"")
                 return
 
             reactor.callFromThread(producer._write, chunk)
