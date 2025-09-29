@@ -141,6 +141,7 @@ class S3StorageProviderBackend(StorageProvider):
 
         def _store_file():
             with LoggingContext(parent_context=parent_logcontext):
+                logger.info("Uploading %s", path)
                 if self._cse_client:
                     self.store_with_client_side_encryption(path)
                 else:
@@ -348,6 +349,8 @@ def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
         timeout (float|None): Timeout in seconds to wait for consume to resume
             after being paused
     """
+    logger.info("Starting streaming...")
+    
     # Set when we should be producing, cleared when we are paused
     wakeup_event = producer.wakeup_event
     # Set if we should stop producing forever
@@ -367,7 +370,7 @@ def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
             # Check if we were woken up so that we abort the download
             if stop_event.is_set():
                 # Set the footer to avoid exceptions when exited.
-                decryptor.footer = MessageFooter(b"")
+                # decryptor.footer = MessageFooter(b"")
                 return
 
             reactor.callFromThread(producer._write, chunk)
