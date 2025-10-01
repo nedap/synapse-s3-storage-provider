@@ -347,7 +347,6 @@ def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
         timeout (float|None): Timeout in seconds to wait for consume to resume
             after being paused
     """
-    logger.info("Starting streaming...")
     
     # Set when we should be producing, cleared when we are paused
     wakeup_event = producer.wakeup_event
