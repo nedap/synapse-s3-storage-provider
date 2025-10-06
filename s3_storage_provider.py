@@ -439,7 +439,11 @@ class _S3Responder(Responder):
     def _finish(self):
         """Called when there is no more data to write. Called by _S3DownloadThread."""
         if self.consumer:
-            self.consumer.unregisterProducer()
+            try:
+                self.consumer.unregisterProducer()
+            except AttributeError:
+                logger.info("Producer already removed")
+
             self.consumer = None
 
         if not self.deferred.called:
@@ -499,3 +503,4 @@ class FixedKeyProvider(RawMasterKeyProvider):
             wrapping_key=self.master_key,
             wrapping_key_type=EncryptionKeyType.SYMMETRIC,
         )
+
