@@ -27,6 +27,7 @@ media_storage_providers:
     endpoint_url: <S3_LIKE_SERVICE_ENDPOINT_URL>
     access_key_id: <S3_ACCESS_KEY_ID>
     secret_access_key: <S3_SECRET_ACCESS_KEY>
+    session_token: <S3_SESSION_TOKEN>
 
     # Server Side Encryption for Customer-provided keys
     #sse_customer_key: <S3_SSEC_KEY>
@@ -41,10 +42,24 @@ media_storage_providers:
     # Default is STANDARD.
     #storage_class: "STANDARD_IA"
 
+    # Prefix for all media in bucket, can't be changed once media has been uploaded
+    # Useful if sharing the bucket between Synapses
+    # Blank if not provided
+    #prefix: "prefix/to/files/in/bucket"
+
     # The maximum number of concurrent threads which will be used to connect
     # to S3. Each thread manages a single connection. Default is 40.
     #
     #threadpool_size: 20
+
+    # Set request_checksum_calculation or response_checksum_validation. 
+    # Depending on your S3 provider you may need to set these values,
+    # especially if you are using a self-hosted system that does not
+    # support the functionality provided by AWS.
+    # Default is 'when_required'
+    # request_checksum_calculation: "when_supported" | "when_required"
+    # response_checksum_validation: "when_supported" | "when_required"
+    
 ```
 
 This module uses `boto3`, and so the credentials should be specified as
@@ -91,7 +106,20 @@ Packaging and release
 
 For maintainers:
 
-1. Update the `__version__` in setup.py. Commit. Push.
-2. Create a release on GitHub for this version.
-3. When published, a [GitHub action workflow](https://github.com/matrix-org/synapse-s3-storage-provider/actions/workflows/release.yml) will build the package and upload to [PyPI](https://pypi.org/project/synapse-s3-storage-provider/).
+1. Update the `__version__` in setup.py. Then commit and push the changes:
 
+    ```
+    git add setup.py
+    git commit -m "vX.Y.Z"
+    git push
+    ```
+
+1. Create a signed tag and push that:
+
+    ```
+    git tag -s vX.Y.Z
+    git push origin vX.Y.Z
+    ```
+
+1. [Create a release on GitHub](https://github.com/matrix-org/synapse-s3-storage-provider/releases/new) for this version.
+1. When published, a [GitHub action workflow](https://github.com/matrix-org/synapse-s3-storage-provider/actions/workflows/release.yml) will build the package and upload to [PyPI](https://pypi.org/project/synapse-s3-storage-provider/).

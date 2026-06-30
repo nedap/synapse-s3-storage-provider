@@ -36,7 +36,7 @@ progress = True
 
 
 def parse_duration(string):
-    """Parse a string into a duration supports suffix of d, m or y.
+    """Parse a string into a duration supports suffix of s, h, d, m or y.
     """
     suffix = string[-1]
     number = string[:-1]
@@ -45,7 +45,7 @@ def parse_duration(string):
         number = int(number)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            "duration must be an integer followed by a 'd', 'm' or 'y' suffix"
+            "duration must be an integer followed by a 's', 'h', 'd', 'm' or 'y' suffix"
         )
 
     now = datetime.datetime.now()
@@ -55,8 +55,14 @@ def parse_duration(string):
         then = now - datetime.timedelta(days=30 * number)
     elif suffix == "y":
         then = now - datetime.timedelta(days=365 * number)
+    elif suffix == "h":
+        then = now - datetime.timedelta(hours=number)
+    # We can't sensibly do minutes as months has taken 'm', seconds can be used to implement minutes
+    # This would be the natural suffix as per https://matrix-org.github.io/synapse/latest/usage/configuration/config_documentation.html
+    elif suffix == "s":
+        then = now - datetime.timedelta(seconds=number)
     else:
-        raise argparse.ArgumentTypeError("duration must end in 'd', 'm' or 'y'")
+        raise argparse.ArgumentTypeError("duration must end in 's', 'h', 'd', 'm' or 'y'")
 
     return then
 
@@ -227,7 +233,7 @@ def run_update_db(synapse_db_conn, sqlite_conn, before_date):
     last_access_ts = int(before_date.timestamp() * 1000)
 
     print(
-        "Syncing files that haven't been accessed since:", before_date.isoformat(" "),
+        "Syncing files that haven't been accessed since:", before_date.isoformat(" "), flush=True,
     )
 
     update_count = 0
@@ -235,23 +241,27 @@ def run_update_db(synapse_db_conn, sqlite_conn, before_date):
     with sqlite_conn:
         sqlite_cur = sqlite_conn.cursor()
 
-        if isinstance(synapse_db_conn, sqlite3.Connection):
-            synapse_db_curs = synapse_db_conn.cursor()
-            for sql, mtype in ((local_sql, "local"), (remote_sql, "remote")):
+        for sql, mtype in ((local_sql, "local"), (remote_sql, "remote")):
+            print("  Syncing", mtype, "media", flush=True)
+
+            if isinstance(synapse_db_conn, sqlite3.Connection):
+                synapse_db_curs = synapse_db_conn.cursor()
                 synapse_db_curs.execute(sql.replace("%s", "?"), (last_access_ts,))
                 update_count += update_db_process_rows(
                     mtype, sqlite_cur, synapse_db_curs
                 )
 
-        else:
-            with synapse_db_conn.cursor() as synapse_db_curs:
-                for sql, mtype in ((local_sql, "local"), (remote_sql, "remote")):
+            else:
+                # We use a named (server-side) cursor, so that we don't have to wait
+                # for Postgres to send back all 200M items before we get started with
+                # the sync operation.
+                with synapse_db_conn.cursor('%s_items' % (mtype, )) as synapse_db_curs:
                     synapse_db_curs.execute(sql, (last_access_ts,))
                     update_count += update_db_process_rows(
                         mtype, sqlite_cur, synapse_db_curs
                     )
 
-    print("Synced", update_count, "new rows")
+    print("Synced", update_count, "new rows", flush=True)
 
     synapse_db_conn.close()
 
@@ -287,7 +297,7 @@ def run_check_delete(sqlite_conn, base_path):
         )
     else:
         it = get_not_deleted(sqlite_conn)
-        print("Checking on ", get_not_deleted_count(sqlite_conn), " undeleted files")
+        print("Checking on ", get_not_deleted_count(sqlite_conn), " undeleted files", flush=True)
 
     for origin, media_id, filesystem_id, m_type in it:
         local_files = get_local_files(base_path, origin, filesystem_id, m_type)
@@ -303,10 +313,10 @@ def run_check_delete(sqlite_conn, base_path):
             ((True, o, m) for o, m in deleted),
         )
 
-    print("Updated", len(deleted), "as deleted")
+    print("Updated", len(deleted), "as deleted", flush=True)
 
 
-def run_upload(s3, bucket, sqlite_conn, base_path, extra_args, should_delete, cse_master_key):
+def run_upload(s3, bucket, sqlite_conn, base_path, s3_prefix, extra_args, should_delete, cse_master_key):
     """Entry point for upload command
     """
     total = get_not_deleted_count(sqlite_conn)
@@ -322,7 +332,7 @@ def run_upload(s3, bucket, sqlite_conn, base_path, extra_args, should_delete, cs
     if progress:
         it = tqdm.tqdm(get_not_deleted(sqlite_conn), unit="files", total=total)
     else:
-        print("Uploading ", total, " files")
+        print("Uploading ", total, " files", flush=True)
         it = get_not_deleted(sqlite_conn)
 
     for origin, media_id, filesystem_id, m_type in it:
@@ -337,26 +347,28 @@ def run_upload(s3, bucket, sqlite_conn, base_path, extra_args, should_delete, cs
         media_deleted_files = 0
 
         if cse_master_key:
-            cse_client = ClientSideEncryption('x')
+            cse_client = ClientSideEncryption(cse_master_key)
 
         for rel_file_path in local_files:
             local_path = os.path.join(base_path, rel_file_path)
 
-            if not check_file_in_s3(s3, bucket, rel_file_path, extra_args):
+            key = s3_prefix + rel_file_path
+            if not check_file_in_s3(s3, bucket, key, extra_args):
                 try:
                     if cse_master_key:
-                        with cse_client.encrypt as encryptor:
-                            s3.upload_fileobj(
-                                Fileobj=encryptor, 
-                                Bucket=bucket, 
-                                Key=rel_file_path,
-                                ExtraArgs=extra_args)
+                        with open(local_path, "rb") as f:
+                            with cse_client.encrypt(f) as encryptor:
+                                s3.upload_fileobj(
+                                    Fileobj=encryptor,
+                                    Bucket=bucket,
+                                    Key=key,
+                                    ExtraArgs=extra_args)
                     else:
                         s3.upload_file(
-                            local_path, bucket, rel_file_path, ExtraArgs=extra_args,
+                            local_path, bucket, key, ExtraArgs=extra_args,
                         )
                 except Exception as e:
-                    print("Failed to upload file %s: %s", local_path, e)
+                    print("Failed to upload file %s: %s", local_path, e, flush=True)
                     continue
 
                 media_uploaded_files += 1
@@ -395,7 +407,7 @@ def run_upload(s3, bucket, sqlite_conn, base_path, extra_args, should_delete, cs
     print("Uploaded", humanize.naturalsize(uploaded_bytes, gnu=True))
     print("Deleted", deleted_media, "media")
     print("Deleted", deleted_files, "files")
-    print("Deleted", humanize.naturalsize(deleted_bytes, gnu=True))
+    print("Deleted", humanize.naturalsize(deleted_bytes, gnu=True), flush=True)
 
 
 def get_sqlite_conn(parser):
@@ -409,31 +421,28 @@ def get_sqlite_conn(parser):
 
     return sqlite_conn
 
-def get_homeserver_db_conn(parser):
-    """Attempt to get a connection based on homeserver.yaml to Synapse's
+def get_homeserver_db_conn(parser, homeserver_config_path):
+    """Attempt to get a connection based on the provided YAML path to Synapse's
     database, or exit.
     """
 
     try:
-        with open("homeserver.yaml") as f:
+        with open(homeserver_config_path) as f:
             homeserver_yaml = yaml.safe_load(f)
     except FileNotFoundError:
-        parser.error("Could not find homeserver.yaml")
+        parser.error("Could not find %s" % (homeserver_config_path,))
     except yaml.YAMLError as e:
-        parser.error("homeserver.yaml is not valid yaml: %s" % (e,))
+        parser.error("%s is not valid yaml: %s" % (homeserver_config_path, e,))
 
     try:
-        database_name = homeserver_yaml["database"]["name"]
+        database_engine_name = homeserver_yaml["database"]["name"]
         database_args = homeserver_yaml["database"]["args"]
-        if database_name == "sqlite3":
-            synapse_db_conn = sqlite3.connect(database=database_args["database"])
+        if database_engine_name == "sqlite3":
+            database_path = database_args["database"]
+            synapse_db_conn = sqlite3.connect(database=database_path)
         else:
-            synapse_db_conn = psycopg2.connect(
-                user=database_args["user"],
-                password=database_args["password"],
-                database=database_args["database"],
-                host=database_args["host"],
-            )
+            config = {k:v for k,v in database_args.items() if not k.startswith("cp_")}
+            synapse_db_conn = psycopg2.connect(**config)
     except sqlite3.OperationalError as e:
         parser.error("Could not connect to sqlite3 database: %s" % (e,))
     except psycopg2.Error as e:
@@ -468,15 +477,15 @@ def get_database_db_conn(parser):
 
     return synapse_db_conn
 
-def get_synapse_db_conn(parser):
-    """Attempt to get a connection based on database.yaml or homeserver.yaml 
+def get_synapse_db_conn(parser, homeserver_config_path):
+    """Attempt to get a connection based on database.yaml or homeserver.yaml
     to Synapse's database, or exit.
     """
 
     if os.path.isfile("database.yaml"):
         conn = get_database_db_conn(parser)
     else:
-        conn = get_homeserver_db_conn(parser)
+        conn = get_homeserver_db_conn(parser, homeserver_config_path)
 
     return conn
 
@@ -498,7 +507,12 @@ def main():
         type=parse_duration,
         help="Fetch rows that haven't been accessed in the duration given,"
         " accepts duration of the form of e.g. 1m (one month). Valid suffixes"
-        " are d, m or y. NOTE: Currently does not remove entries from the cache",
+        " are s, h, d, m or y. NOTE: Currently does not remove entries from the cache",
+    )
+    update_db_parser.add_argument(
+        "--homeserver-config-path",
+        help="Path to the yaml file containing Synapse's DB settings",
+        default="homeserver.yaml"
     )
 
     deleted_parser = subparsers.add_parser(
@@ -522,7 +536,12 @@ def main():
         type=parse_duration,
         help="Fetch rows that haven't been accessed in the duration given,"
         " accepts duration of the form of e.g. 1m (one month). Valid suffixes"
-        " are d, m or y. NOTE: Currently does not remove entries from the cache",
+        " are s, h, d, m or y. NOTE: Currently does not remove entries from the cache",
+    )
+    update_parser.add_argument(
+        "--homeserver-config-path",
+        help="Path to the yaml file containing Synapse's DB settings",
+        default="homeserver.yaml"
     )
 
     write_parser = subparsers.add_parser(
@@ -545,6 +564,8 @@ def main():
         "base_path", help="Base path of the media store directory"
     )
     upload_parser.add_argument("bucket", help="S3 bucket to upload to")
+
+    upload_parser.add_argument("--prefix", help="Prefix of files in the bucket", default="")
 
     upload_parser.add_argument(
         "--storage-class",
@@ -593,7 +614,7 @@ def main():
 
     if args.cmd == "update-db":
         sqlite_conn = get_sqlite_conn(parser)
-        synapse_db_conn = get_synapse_db_conn(parser)
+        synapse_db_conn = get_synapse_db_conn(parser, args.homeserver_config_path)
         run_update_db(synapse_db_conn, sqlite_conn, args.duration)
         return
 
@@ -604,7 +625,7 @@ def main():
 
     if args.cmd == "update":
         sqlite_conn = get_sqlite_conn(parser)
-        synapse_db_conn = get_synapse_db_conn(parser)
+        synapse_db_conn = get_synapse_db_conn(parser, args.homeserver_config_path)
         run_update_db(synapse_db_conn, sqlite_conn, args.duration)
         run_check_delete(sqlite_conn, args.base_path)
         return
@@ -626,6 +647,7 @@ def main():
             args.bucket,
             sqlite_conn,
             args.base_path,
+            args.prefix,
             extra_args,
             should_delete=args.delete,
             cse_master_key=args.cse_master_key
