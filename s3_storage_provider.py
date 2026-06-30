@@ -172,8 +172,6 @@ class S3StorageProviderBackend(StorageProvider):
         """See StorageProvider.fetch"""
         d = defer.Deferred()
 
-        def _get_file():
-            s3_download_task(self, self.bucket, path, self.extra_args, d, logcontext)
         # Don't await this directly, as it will resolve only once the streaming
         # download from S3 is concluded. Before that happens, we want to pass
         # execution back to Synapse to stream the file's chunks.
@@ -186,6 +184,7 @@ class S3StorageProviderBackend(StorageProvider):
             self._s3_pool,
             s3_download_task,
             self._get_s3_client(),
+            self._cse_client,
             self.bucket,
             self.prefix + path,
             self.extra_args,
@@ -246,7 +245,7 @@ class S3StorageProviderBackend(StorageProvider):
         return result
 
 
-def s3_download_task(s3_client, bucket, key, extra_args, deferred):
+def s3_download_task(s3_client, cse_client, bucket, key, extra_args, deferred):
     """Attempts to download a file from S3.
 
     Args:
@@ -285,10 +284,10 @@ def s3_download_task(s3_client, bucket, key, extra_args, deferred):
 
     producer = _S3Responder()
     reactor.callFromThread(deferred.callback, producer)
-    _stream_to_producer(reactor, producer, resp["Body"], s3, timeout=90.0)
+    _stream_to_producer(reactor, producer, resp["Body"], cse_client=cse_client, timeout=90.0)
 
 
-def _stream_to_producer(reactor, producer, body, s3, status=None, timeout=None):
+def _stream_to_producer(reactor, producer, body, cse_client=None, status=None, timeout=None):
     """Streams a file like object to the producer.
 
     Correctly handles producer being paused/resumed/stopped.
@@ -308,8 +307,8 @@ def _stream_to_producer(reactor, producer, body, s3, status=None, timeout=None):
         status = _ProducerStatus()
 
     try:
-        if s3._cse_client:
-            stream_body_with_cse(body, producer, reactor, s3, timeout, status)
+        if cse_client:
+            stream_body_with_cse(body, producer, reactor, cse_client, timeout, status)
         else:
             stream_body(body, producer, reactor, status, timeout)
     except Exception:
@@ -358,7 +357,7 @@ def stream_body(body, producer, reactor, status, timeout):
         reactor.callFromThread(producer._write, chunk)
 
 
-def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
+def stream_body_with_cse(body, producer, reactor, cse_client, timeout, status):
     """Stream body with client-side encryption logic
 
     Args:
@@ -376,7 +375,7 @@ def stream_body_with_cse(body, producer, reactor, s3, timeout, status):
     wakeup_event = producer.wakeup_event
     # Set if we should stop producing forever
     stop_event = producer.stop_event
-    with s3._cse_client.decrypt(body) as decryptor:
+    with cse_client.decrypt(body) as decryptor:
         for chunk in decryptor:
             # We wait for the producer to signal that the consumer wants
             # more data (or we should abort)
