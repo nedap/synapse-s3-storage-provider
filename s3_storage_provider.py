@@ -34,20 +34,14 @@ import boto3
 import botocore
 from botocore.config import Config
 
-from twisted.internet import defer, reactor, threads
+from twisted.internet import defer, reactor
 from twisted.python.failure import Failure
 from twisted.python.threadpool import ThreadPool
 
-from synapse.logging.context import LoggingContext, make_deferred_yieldable
+from synapse.logging.context import make_deferred_yieldable
+from synapse.module_api import ModuleApi, run_in_background
 from synapse.rest.media.v1._base import Responder
 from synapse.rest.media.v1.storage_provider import StorageProvider
-
-
-# Synapse 1.13.0 moved current_context to a module-level function.
-try:
-    from synapse.logging.context import current_context
-except ImportError:
-    current_context = LoggingContext.current_context
 
 logger = logging.getLogger("synapse.s3")
 
@@ -72,8 +66,10 @@ class S3StorageProviderBackend(StorageProvider):
     """
 
     def __init__(self, hs, config):
+        self._module_api: ModuleApi = hs.get_module_api()
         self.cache_directory = hs.config.media.media_store_path
         self.bucket = config["bucket"]
+        self.prefix = config["prefix"]
         # A dictionary of extra arguments for uploading files.
         # See https://boto3.amazonaws.com/v1/documentation/api/latest/reference/customizations/s3.html#boto3.s3.transfer.S3Transfer.ALLOWED_UPLOAD_ARGS
         # for a list of possible keys.
@@ -91,6 +87,14 @@ class S3StorageProviderBackend(StorageProvider):
 
         if "secret_access_key" in config:
             self.api_kwargs["aws_secret_access_key"] = config["secret_access_key"]
+
+        if "session_token" in config:
+            self.api_kwargs["aws_session_token"] = config["session_token"]
+
+        self.api_kwargs["config"] = Config(
+            response_checksum_validation=config.get("response_checksum_validation", "when_required"),
+            request_checksum_calculation=config.get("request_checksum_calculation", "when_required")
+        )
 
         self._s3_client = None
         self._s3_client_lock = threading.Lock()
@@ -132,26 +136,24 @@ class S3StorageProviderBackend(StorageProvider):
                 self._s3_client = s3 = b3_session.client("s3", **self.api_kwargs)
             return s3
 
-    def store_file(self, path, file_info):
+    async def store_file(self, path, file_info):
         """See StorageProvider.store_file"""
 
-        parent_logcontext = current_context()
-
         def _store_file():
-            with LoggingContext(parent_context=parent_logcontext):
-                logger.info("Uploading %s", path)
-                if self._cse_client:
-                    self.store_with_client_side_encryption(path)
-                else:
-                    self._get_s3_client().upload_file(
-                        Filename=os.path.join(self.cache_directory, path),
-                        Bucket=self.bucket,
-                        Key=path,
-                        ExtraArgs=self.extra_args,
-                    )
+            logger.info("Uploading %s", path)
+            if self._cse_client:
+                self.store_with_client_side_encryption(path)
+            else:
+                self._get_s3_client().upload_file(
+                    Filename=os.path.join(self.cache_directory, path),
+                    Bucket=self.bucket,
+                    Key=self.prefix + path,
+                    ExtraArgs=self.extra_args,
+                )
 
-        return make_deferred_yieldable(
-            threads.deferToThreadPool(reactor, self._s3_pool, _store_file)
+        return await self._module_api.defer_to_threadpool(
+            self._s3_pool,
+            _store_file
         )
 
     def store_with_client_side_encryption(self, path):
@@ -162,21 +164,38 @@ class S3StorageProviderBackend(StorageProvider):
                 s3_client.upload_fileobj(
                     Fileobj=encryptor,
                     Bucket=self.bucket,
-                    Key=path,
+                    Key=self.prefix + path,
                     ExtraArgs=self.extra_args,
                 )
 
-    def fetch(self, path, file_info):
+    async def fetch(self, path, file_info):
         """See StorageProvider.fetch"""
-        logcontext = current_context()
-
         d = defer.Deferred()
 
         def _get_file():
             s3_download_task(self, self.bucket, path, self.extra_args, d, logcontext)
+        # Don't await this directly, as it will resolve only once the streaming
+        # download from S3 is concluded. Before that happens, we want to pass
+        # execution back to Synapse to stream the file's chunks.
+        #
+        # We do, however, need to wrap in `run_in_background` to ensure that the
+        # coroutine returned by `defer_to_threadpool` is used, and therefore
+        # actually run.
+        run_in_background(
+            self._module_api.defer_to_threadpool,
+            self._s3_pool,
+            s3_download_task,
+            self._get_s3_client(),
+            self.bucket,
+            self.prefix + path,
+            self.extra_args,
+            d,
+        )
 
-        self._s3_pool.callInThread(_get_file)
-        return make_deferred_yieldable(d)
+        # DO await on `d`, as it will resolve once a connection to S3 has been
+        # opened. We only want to return to Synapse once we can start streaming
+        # chunks.
+        return await make_deferred_yieldable(d)
 
     @staticmethod
     def parse_config(config):
@@ -185,9 +204,10 @@ class S3StorageProviderBackend(StorageProvider):
 
         The returned value is passed into the constructor.
 
-        In this case we return a dict with fields, `bucket` and `storage_class`
+        In this case we return a dict with fields, `bucket`, `prefix` and `storage_class`
         """
         bucket = config["bucket"]
+        prefix = config.get("prefix", "")
         storage_class = config.get("storage_class", "STANDARD")
 
         assert isinstance(bucket, string_types)
@@ -195,20 +215,24 @@ class S3StorageProviderBackend(StorageProvider):
 
         result = {
             "bucket": bucket,
+            "prefix": prefix,
             "extra_args": {"StorageClass": storage_class},
         }
 
         if "region_name" in config:
-            result["region_name"] = config["region_name"]
+            result["region_name"] = str(config["region_name"])
 
         if "endpoint_url" in config:
             result["endpoint_url"] = config["endpoint_url"]
 
         if "access_key_id" in config:
-            result["access_key_id"] = config["access_key_id"]
+            result["access_key_id"] = str(config["access_key_id"])
 
         if "secret_access_key" in config:
             result["secret_access_key"] = config["secret_access_key"]
+
+        if "session_token" in config:
+            result["session_token"] = config["session_token"]
 
         if "sse_customer_key" in config:
             result["extra_args"]["SSECustomerKey"] = config["sse_customer_key"]
@@ -222,7 +246,7 @@ class S3StorageProviderBackend(StorageProvider):
         return result
 
 
-def s3_download_task(s3, bucket, key, extra_args, deferred, parent_logcontext):
+def s3_download_task(s3_client, bucket, key, extra_args, deferred):
     """Attempts to download a file from S3.
 
     Args:
@@ -232,36 +256,36 @@ def s3_download_task(s3, bucket, key, extra_args, deferred, parent_logcontext):
         deferred (Deferred[_S3Responder|None]): If file exists
             resolved with an _S3Responder instance, if it doesn't
             exist then resolves with None.
-        parent_logcontext (LoggingContext): the logcontext to report logs and metrics
-            against.
+    
+    Returns:
+        A deferred which resolves to an _S3Responder if the file exists.
+        Otherwise the deferred fails.
     """
-    with LoggingContext(parent_context=parent_logcontext):
-        logger.info("Fetching %s from S3", key)
+    logger.info("Fetching %s from S3", key)
 
-        s3_client = s3._get_s3_client()
-        try:
-            if "SSECustomerKey" in extra_args and "SSECustomerAlgorithm" in extra_args:
-                resp = s3_client.get_object(
-                    Bucket=bucket,
-                    Key=key,
-                    SSECustomerKey=extra_args["SSECustomerKey"],
-                    SSECustomerAlgorithm=extra_args["SSECustomerAlgorithm"],
-                )
-            else:
-                resp = s3_client.get_object(Bucket=bucket, Key=key)
+    try:
+        if "SSECustomerKey" in extra_args and "SSECustomerAlgorithm" in extra_args:
+            resp = s3_client.get_object(
+                Bucket=bucket,
+                Key=key,
+                SSECustomerKey=extra_args["SSECustomerKey"],
+                SSECustomerAlgorithm=extra_args["SSECustomerAlgorithm"],
+            )
+        else:
+            resp = s3_client.get_object(Bucket=bucket, Key=key)
 
-        except botocore.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
-                logger.info("Media %s not found in S3", key)
-                reactor.callFromThread(deferred.callback, None)
-                return
-
-            reactor.callFromThread(deferred.errback, Failure())
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            logger.info("Media %s not found in S3", key)
+            reactor.callFromThread(deferred.callback, None)
             return
 
-        producer = _S3Responder()
-        reactor.callFromThread(deferred.callback, producer)
-        _stream_to_producer(reactor, producer, resp["Body"], s3, timeout=90.0)
+        reactor.callFromThread(deferred.errback, Failure())
+        return
+
+    producer = _S3Responder()
+    reactor.callFromThread(deferred.callback, producer)
+    _stream_to_producer(reactor, producer, resp["Body"], s3, timeout=90.0)
 
 
 def _stream_to_producer(reactor, producer, body, s3, status=None, timeout=None):

@@ -1,6 +1,6 @@
 from setuptools import setup
 
-__version__ = "1.2.1"
+__version__ = "1.6.1"
 
 with open("README.md") as f:
     long_description = f.read()
@@ -18,12 +18,13 @@ setup(
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: Apache Software License",
     ],
+    python_requires='>=3.10, <4',
     py_modules=["s3_storage_provider"],
     scripts=["scripts/s3_media_upload"],
     install_requires=[
-        "boto3>=1.9.23,<2.0",
-        "botocore>=1.12.23,<2.0",
-        "humanize>=0.5.1,<0.6",
+        "boto3>=1.36.0,<2.0",
+        "botocore>=1.36.0,<2.0",
+        "humanize>=4.0,<5.0",
         "psycopg2>=2.7.5,<3.0",
         "PyYAML>=5.4,<7.0",
         "tqdm>=4.26.0,<5.0",

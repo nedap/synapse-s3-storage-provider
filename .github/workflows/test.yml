@@ -6,16 +6,22 @@ on:
       - main
       - 'releases/*'
 
+permissions:
+  # In order to check out the repository.
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    - uses: actions/setup-python@v4
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
       with:
         python-version: "3.x"
     - name: Run synapse
-      uses: michaelkaye/setup-matrix-synapse@v1.0.1
+      uses: michaelkaye/setup-matrix-synapse@e080023c56271cab986b83db75edba570fafb88b # v1.0.6
       with: 
         uploadLogs: true
         httpPort: 8008
@@ -58,7 +64,7 @@ jobs:
         server_name=`echo $mxc | sed 's^mxc://\(.*\)/.*^\1^'`
         media_id=`echo $mxc | sed 's^mxc://.*/\(.*\)^\1^'`
         #Downloading uploaded file
-        curl -q -o round_trip http://127.0.0.1:8008/_matrix/media/v3/download/${server_name}/${media_id}/
+        curl -q -o round_trip -H "Authorization: Bearer $access_token" http://127.0.0.1:8008/_matrix/client/v1/media/download/${server_name}/${media_id}
         #Verify file against original
         diff round_trip s3_storage_provider.py
         #Verify file against minio data store
